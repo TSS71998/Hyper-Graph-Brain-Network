@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument('--dataset',       type=str,   default='adni')
     parser.add_argument('--mode',          type=str,   default='function')
     parser.add_argument('--network',       type=str,   default='yeo7')
+    parser.add_argument('--model',        type=str,   default='hgnn', choices=['hgnn', 'transformer'])
+    parser.add_argument('--alpha_mode',   type=str,   default='attn+hcof', choices=['attn', 'hcof', 'attn+hcof'])
+    parser.add_argument('--roi2net',      type=str,   default=None)   # AAL -> Yeo7 label file
+    parser.add_argument('--window',       type=int,   default=20)     # w in hDYN
+    parser.add_argument('--edge_density', type=float, default=0.10)
+    parser.add_argument('--sca_tau',      type=int,   default=1)
     return parser.parse_args()
 
 

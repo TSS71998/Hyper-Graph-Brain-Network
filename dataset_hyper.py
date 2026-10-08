@@ -5,126 +5,167 @@ import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from itertools import combinations
+from collections import defaultdict
 
 # ─────────────────────────────────────────────────────────────────
 # HOC Co-Fluctuation & RSS Binning Utilities
 # ─────────────────────────────────────────────────────────────────
 
-def zscore(ts_raw, eps=1e-6):
-    mu = ts_raw.mean(axis=0, keepdims=True)
-    sig = ts_raw.std(axis=0, keepdims=True)
-    return (ts_raw - mu) / (sig + eps)
+def zscore(ts, eps=1e-8):
+    """ts: (T, N) -> column-wise z-score."""
+    return (ts - ts.mean(0, keepdims=True)) / (ts.std(0, keepdims=True) + eps)
 
-def compute_rss(signal_ts):
-    """signal_ts: (M, T) -> RSS (T,)"""
-    return np.sqrt(np.sum(signal_ts ** 2, axis=0))
+def hyperedge_ts(ts_z, hyperedges):
+    """hTS_e(t) = prod_{v in e} z_v(t).   ts_z: (T, N) -> (E, T)"""
+    return np.stack([ts_z[:, sorted(e)].prod(axis=1) for e in hyperedges]).astype(np.float32)
 
-def rss_bin_means(signal_ts, K=5):
-    """
-    Sort T timepoints by overall RSS, partition into K activity bins,
-    and compute average co-fluctuation per bin. Returns: (M, K)
-    """
-    M, T = signal_ts.shape
-    rss = compute_rss(signal_ts)
-    sort_idx = np.argsort(rss)
-    bsz = T // K
-    bins = np.zeros((M, K), dtype=np.float32)
-    for k in range(K):
-        bin_t = sort_idx[k * bsz : (k + 1) * bsz]
-        bins[:, k] = signal_ts[:, bin_t].mean(axis=1)
-    return bins
+def h_dyn(sig, w=20):
+    """hDYN_e = Var_tau( (1/w) * sum_{t=tau}^{tau+w-1} hTS_e(t) ),
+    over every tau = 0..T-w (stride 1, as in the equation).  sig: (M, T) -> (M, 1)"""
+    M, T = sig.shape
+    if T < w:
+        return np.zeros((M, 1), np.float32)
+    c = np.cumsum(np.pad(sig, ((0, 0), (1, 0))), axis=1)   # c[:, k] = sum of first k samples
+    win_mean = (c[:, w:] - c[:, :-w]) / w                    # (M, T-w+1)
+    return win_mean.var(axis=1, keepdims=True).astype(np.float32)
 
-def compute_windowed_var(ts_signals, window_size=20, stride=5):
-    """
-    Computes sliding-window variance for signals of shape (M, T).
-    Returns: (M, 1)
-    """
-    M, T = ts_signals.shape
-    windows = []
-    for start in range(0, T - window_size + 1, stride):
-        w = ts_signals[:, start : start + window_size].mean(axis=1)
-        windows.append(w)
-    if len(windows) == 0:
-        return np.zeros((M, 1), dtype=np.float32)
-    return np.stack(windows, axis=1).var(axis=1, keepdims=True).astype(np.float32)
+def rss(hts):
+    """RSS(t) = sqrt( sum_{e in E} hTS_e(t)^2 ).  (E, T) -> (T,)"""
+    return np.sqrt((hts ** 2).sum(axis=0))
+
+def rss_bins(hts, B=5):
+    """Sort timepoints by RSS and split into B bins T_1..T_B (low -> high amplitude).
+    array_split keeps every timepoint even when T is not divisible by B."""
+    return np.array_split(np.argsort(rss(hts)), B)
+
+def h_cof(sig, bins):
+    """hCoF_e^b = (1/|T_b|) * sum_{t in T_b} hTS_e(t).  (M, T) -> (M, B)"""
+    return np.stack([sig[:, tb].mean(axis=1) for tb in bins], axis=1).astype(np.float32)
+
+
+
+# ═════════════════════════════════════════════════════════════════
+# Candidate hypergraph: order 2 (pairs), order 3 (triangles), k-NN groups
+# ═════════════════════════════════════════════════════════════════
+
+def candidate_hyperedges(fc, k_neighbors=8, n_tri_cands=5, max_tri_per_roi=3, edge_density=0.10):
+    N = fc.shape[0]
+    a = np.abs(fc.copy())
+    np.fill_diagonal(a, -1.0)
+    seen, hyperedges = set(), []
+
+    def add(e):
+        e = frozenset(int(v) for v in e)
+        if len(e) >= 2 and e not in seen:
+            seen.add(e)
+            hyperedges.append(e)
+
+    # order 2: strongest |FC| pairs (the pairwise level the scaffold is defined on)
+    iu = np.triu_indices(N, 1)
+    n_keep = max(1, int(edge_density * len(iu[0])))
+    for k in np.argsort(a[iu])[-n_keep:]:
+        add((iu[0][k], iu[1][k]))
+
+    # order 3: strongest triangles anchored at each ROI
+    for i in range(N):
+        cands = np.argsort(a[i])[-n_tri_cands:]
+        tris = sorted(((a[i, u] + a[i, v] + a[u, v], (i, u, v))
+                       for u, v in combinations(cands, 2)), reverse=True)
+        for _, tri in tris[:max_tri_per_roi]:
+            add(tri)
+
+    # order k+1: k-NN neighbourhoods
+    for i in range(N):
+        add([i, *np.argsort(a[i])[-k_neighbors:]])
+
+    return hyperedges
+
+def scaffold_weights(hyperedges, mode="next_order"):
+    """w_e^sca = number of larger hyperedges that contain e.
+    mode="next_order": count only hyperedges of the next size up (pairs in triangles,
+                       triangles in k-NN groups).
+    mode="any_larger": count every strictly larger superset."""
+    sizes = sorted({len(e) for e in hyperedges})
+    nxt = {s: sizes[i + 1] for i, s in enumerate(sizes[:-1])}
+    w = np.zeros(len(hyperedges), np.float32)
+    for i, e in enumerate(hyperedges):
+        if len(e) not in nxt:
+            continue                       # top order: nothing larger to sit inside
+        for f in hyperedges:
+            size_ok = len(f) == nxt[len(e)] if mode == "next_order" else len(f) > len(e)
+            if size_ok and e < f:          # frozenset '<' is proper subset
+                w[i] += 1
+    return w
+
+
+def scaffold_filter(hyperedges, w, tau=1):
+    """Keep lower-order hyperedges with w_e^sca >= tau. Top-order hyperedges have no
+    larger hyperedges to be counted in, so they are always kept."""
+    max_size = max(len(e) for e in hyperedges)
+    keep = [i for i, e in enumerate(hyperedges) if len(e) == max_size or w[i] >= tau]
+    return [hyperedges[i] for i in keep], w[keep]
+
+
+def hyperedge_system(hyperedges, roi2net, Q):
+    """Assign each hyperedge to the system holding the majority of its members."""
+    return np.array([np.bincount(roi2net[sorted(e)], minlength=Q).argmax()
+                     for e in hyperedges], dtype=np.int64)
+
+
+def scaffold_system_ts(hts, w, e_net, Q):
+    """scaTS_q(t) = (1/|E_q^sca|) * sum_{e in E_q^sca} w_e^sca * hTS_e(t).  -> (Q, T)
+    E_q^sca = scaffold hyperedges (w_e > 0) assigned to system q."""
+    out = np.zeros((Q, hts.shape[1]), np.float32)
+    members = defaultdict(list)
+    for i in np.flatnonzero(w > 0):
+        members[int(e_net[i])].append(i)
+    for q, idx in members.items():
+        out[q] = (w[idx, None] * hts[idx]).sum(0) / len(idx)
+    return out
 
 # ─────────────────────────────────────────────────────────────────
 # Hypergraph Builder
 # ─────────────────────────────────────────────────────────────────
 
-def build_hypergraph(ts, k_neighbors=8, max_triangles_per_roi=3, K_bins=5):
-    """
-    Constructs an incident hypergraph with:
-      1. k-NN cluster hyperedges around each node
-      2. High-affinity triangle hyperedges (3-region dynamics)
-    Returns:
-      node_features: (N, N)
-      hyperedge_index: (2, num_incidences) where row 0 = node, row 1 = hyperedge
-      hyperedge_attr: (num_hyperedges, 1 + K_bins) [variance + K bins]
-    """
+def build_hypergraph(ts, roi2net=None, k_neighbors=8, K_bins=5, window=20,
+                     edge_density=0.10, sca_tau=1, sca_mode="next_order"):
     T, N = ts.shape
-    ts_z = zscore(ts)  # (T, N)
-    fc = np.corrcoef(ts_z.T)
-    fc = np.nan_to_num(fc)
+    ts_z = zscore(ts)
+    fc = np.nan_to_num(np.corrcoef(ts_z.T))
+    roi2net = np.zeros(N, np.int64) if roi2net is None else np.asarray(roi2net, np.int64)
+    Q = int(roi2net.max()) + 1
 
-    hyperedges = []       # list of list of node indices
-    hyperedge_types = []  # track grouping type
+    # §2 scaffold: weight candidates, then filter
+    cand = candidate_hyperedges(fc, k_neighbors, edge_density=edge_density)
+    w_all = scaffold_weights(cand, sca_mode)
+    hyperedges, w_sca = scaffold_filter(cand, w_all, sca_tau)
 
-    # 1. k-NN Neighborhood Hyperedges (N hyperedges)
-    for i in range(N):
-        corr_row = np.abs(fc[i])
-        corr_row[i] = -1.0
-        top_k = np.argsort(corr_row)[-k_neighbors:].tolist()
-        group = list(set([i] + top_k))
-        hyperedges.append(group)
-        hyperedge_types.append('knn')
+    # §1 dynamics on the retained hypergraph E
+    hts = hyperedge_ts(ts_z, hyperedges)                       # (E, T)
+    bins = rss_bins(hts, K_bins)                               # T_1..T_B
+    f_e = np.concatenate([h_dyn(hts, window),
+                          h_cof(hts, bins)], axis=1)           # f_e = [hDYN, hCoF^1..B]
 
-    # 2. Triangle Hyperedges (Strongest 3-node cliques per region)
-    for i in range(N):
-        corr_row = np.abs(fc[i])
-        corr_row[i] = -1.0
-        top_cands = np.argsort(corr_row)[-5:].tolist()
-        # Find strongest internal pairs among candidates
-        tri_pairs = []
-        for u, v in combinations(top_cands, 2):
-            score = np.abs(fc[u, v]) + np.abs(fc[i, u]) + np.abs(fc[i, v])
-            tri_pairs.append(((i, u, v), score))
-        tri_pairs.sort(key=lambda x: x[1], reverse=True)
-        for tri, _ in tri_pairs[:max_triangles_per_roi]:
-            if sorted(tri) not in [sorted(h) for h in hyperedges]:
-                hyperedges.append(list(tri))
-                hyperedge_types.append('triangle')
+    # §2 system-level scaffold profiles (same RSS bins as the hyperedges)
+    e_net = hyperedge_system(hyperedges, roi2net, Q)
+    sca_ts = scaffold_system_ts(hts, w_sca, e_net, Q)          # (Q, T)
+    sca_f = np.concatenate([h_dyn(sca_ts, window),
+                            h_cof(sca_ts, bins)], axis=1)      # (Q, 1+B)
 
-    num_hyperedges = len(hyperedges)
+    # incidence H as (node, hyperedge) pairs
+    inc = [(v, i) for i, e in enumerate(hyperedges) for v in sorted(e)]
 
-    # ─────────────────────────────────────────────────────────────
-    # Compute Hyperedge Time Series (hTS) and Features
-    # ─────────────────────────────────────────────────────────────
-    # For hyperedge e: hTS_e(t) = prod_{v in e} z_v(t)
-    hTS = np.zeros((num_hyperedges, T), dtype=np.float32)
-    for e_idx, members in enumerate(hyperedges):
-        sub_signals = ts_z[:, members]  # (T, |e|)
-        hTS[e_idx] = np.prod(sub_signals, axis=1)
-
-    hDYN = compute_windowed_var(hTS, window_size=20, stride=5) # (E, 1)
-
-    hCoF = rss_bin_means(hTS, K=K_bins)                          # (E, K)
-
-    hyperedge_attr = np.concatenate([hDYN, hCoF], axis=1)      # (E, 1 + K)
-
-    # Build 2-row incidence list: (node_idx, hyperedge_idx)
-    inc_node = []
-    inc_edge = []
-    for e_idx, members in enumerate(hyperedges):
-        for v in members:
-            inc_node.append(v)
-            inc_edge.append(e_idx)
-
-    hyperedge_index = torch.tensor([inc_node, inc_edge], dtype=torch.long)
-    hyperedge_attr = torch.tensor(hyperedge_attr, dtype=torch.float32)
-    node_features = torch.tensor(fc, dtype=torch.float32)
-
-    return hyperedge_index, hyperedge_attr, node_features
+    return dict(
+        x=torch.tensor(fc, dtype=torch.float32),
+        hyperedge_index=torch.tensor(inc, dtype=torch.long).t().contiguous(),
+        hyperedge_attr=torch.tensor(f_e),                          # (E, 1+B)
+        hcof_top=torch.tensor(f_e[:, -1]),                         # hCoF^B, highest-RSS bin
+        scaffold_w=torch.tensor(w_sca),                            # (E,)
+        hyperedge_order=torch.tensor([len(e) for e in hyperedges]),
+        hyperedge_net=torch.tensor(e_net),
+        node_net=torch.tensor(roi2net),
+        sca_attr=torch.tensor(sca_f).unsqueeze(0),                 # (1, Q, 1+B), batches to (G, Q, 1+B)
+    )
 
 
 class HyperData(Data):
@@ -137,7 +178,8 @@ class HyperData(Data):
 
 
 class Dataset_ADNI_Hyper(Dataset):
-    def __init__(self, data_dir, label_file, num_classes=2, k_neighbors=8, K_bins=5):
+    def __init__(self, data_dir, label_file, num_classes=2, k_neighbors=8, K_bins=5,
+                 roi2net_file=None, window=20, edge_density=0.10, sca_tau=1):
         self.data_dir = data_dir
         self.label_file = label_file
         self.num_classes = num_classes
@@ -145,6 +187,8 @@ class Dataset_ADNI_Hyper(Dataset):
         self.K_bins = K_bins
         self.data = []
         self.labels = []
+        self.roi2net = np.loadtxt(roi2net_file, dtype=np.int64) if roi2net_file else None
+        self.window, self.edge_density, self.sca_tau = window, edge_density, sca_tau
         self._load()
 
     def _load(self):
@@ -172,18 +216,13 @@ class Dataset_ADNI_Hyper(Dataset):
                 continue
             ts = ts[:140, :]
 
-            hyperedge_index, hyperedge_attr, node_feat = build_hypergraph(
-                ts, k_neighbors=self.k_neighbors, K_bins=self.K_bins
-            )
+            g = build_hypergraph(ts, roi2net=self.roi2net, k_neighbors=self.k_neighbors,
+                                 K_bins=self.K_bins, window=self.window,
+                                 edge_density=self.edge_density, sca_tau=self.sca_tau)
+            graph = HyperData(**g, y=torch.tensor(labels_id[dx], dtype=torch.long),
+                              num_nodes=g['x'].size(0))
 
             y = torch.tensor(labels_id[dx], dtype=torch.long)
-            graph = HyperData(
-                x=node_feat,
-                hyperedge_index=hyperedge_index,
-                hyperedge_attr=hyperedge_attr,
-                y=y,
-                num_nodes=node_feat.size(0)
-            )
             self.data.append(graph)
             self.labels.append(labels_id[dx])
 

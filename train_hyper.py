@@ -16,14 +16,18 @@ def print_with_timestamp(message):
 
 def train_hyper(args, device):
     from dataset_hyper import Dataset_ADNI_Hyper
-    from models_hyper import BrainCHEF_HOC
+    from models_hyper import BrainCHEF_HOC, HyperTokenTransformer
 
     dataset = Dataset_ADNI_Hyper(
         data_dir    = 'C:/Users/Thesu/OneDrive/Desktop/Research/data/ADNI/AAL90',
         label_file  = 'C:/Users/Thesu/OneDrive/Desktop/Research/data/ADNI/label-2cls_new.csv',
         num_classes = args.num_classes,
         k_neighbors = 12,
-        K_bins      = 5
+        K_bins      = 5,
+        roi2net_file=args.roi2net, 
+        window      =args.window,
+        edge_density=args.edge_density, 
+        sca_tau     =args.sca_tau
     )
 
     skf       = StratifiedKFold(
@@ -69,13 +73,15 @@ def train_hyper(args, device):
             val_data, batch_size=args.batch_size,
             shuffle=False)
 
-        model     = BrainCHEF_HOC(
-            node_dim   = dataset[0].x.size(1),
-            edge_dim   = dataset[0].hyperedge_attr.size(1),
-            hidden_dim = args.hidden_dim,
-            n_layers   = args.n_layers,
-            n_classes  = args.num_classes,
-            dropout    = args.dropout).to(device)
+        f_dim, n_sys = dataset[0].hyperedge_attr.size(1), dataset[0].sca_attr.size(1)
+        if args.model == 'transformer':
+            model = HyperTokenTransformer(dataset[0].x.size(1), f_dim, n_sys, d=args.hidden_dim,
+                                          n_layers=args.n_layers, dropout=args.dropout,
+                                          n_classes=args.num_classes).to(device)
+        else:
+            model = BrainCHEF_HOC(dataset[0].x.size(1), f_dim, n_sys, args.hidden_dim,
+                                  args.n_layers, args.num_classes, args.dropout,
+                                  alpha_mode=args.alpha_mode).to(device)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=args.learning_rate, weight_decay=2e-3)
@@ -102,6 +108,7 @@ def train_hyper(args, device):
                 lam = np.random.beta(0.4, 0.4) \
                     if data.num_graphs > 1 else 1.0
                 logits, _ = model(data)
+                loss = criterion(logits, data.y)
 
                 if lam < 1.0 and data.num_graphs > 1:
                     idx       = torch.randperm(
